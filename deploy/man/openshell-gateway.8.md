@@ -161,6 +161,13 @@ Compute driver settings such as sandbox image, callback endpoint, image
 pull policy, network name, VM state directory, and guest TLS material are
 configured in the TOML file passed with **--config**.
 
+**--config-dir** *DIR*
+:   Directory of **\*.toml** drop-in fragments merged over the **--config**
+    file. Fragments apply in lexical order and a later fragment wins. Tables
+    merge key by key; scalars and arrays replace. Defaults to **gateway.d**
+    next to the config file when that directory exists.
+    Environment: **OPENSHELL_GATEWAY_CONFIG_DIR**.
+
 # CONFIGURATION PREFLIGHT
 
 Validate a gateway configuration before starting the daemon:

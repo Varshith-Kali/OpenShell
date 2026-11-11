@@ -1505,7 +1505,12 @@ fn parse_and_validate(path: &Path, contents: &str) -> Result<ConfigFile, ConfigF
         path: path.to_path_buf(),
         detail: parse_error_detail(contents, &error),
     })?;
+    validate_loaded(file)
+}
 
+/// Validate a deserialized configuration. Shared by the single-file and
+/// layered loaders so both enforce the same rules on the final result.
+fn validate_loaded(file: ConfigFile) -> Result<ConfigFile, ConfigFileError> {
     match file.openshell.version {
         Some(SCHEMA_VERSION) => {}
         Some(version) => return Err(ConfigFileError::UnsupportedVersion { version }),
@@ -1736,6 +1741,196 @@ pub fn preflight(path: &Path) -> Result<ConfigFile, ConfigPreflightError> {
 pub fn load(path: &Path) -> Result<ConfigFile, ConfigFileError> {
     let contents = read_config_contents(path)?;
     parse_and_validate(path, &contents)
+}
+
+/// Result of loading a base file plus drop-in fragments.
+#[derive(Debug)]
+pub struct LayeredConfig {
+    pub file: ConfigFile,
+    /// Files that contributed to `file`, in merge order (base first).
+    pub sources: Vec<PathBuf>,
+}
+
+/// List the `*.toml` fragments in `dir`, sorted by file name.
+///
+/// Hidden files and entries without a `.toml` extension are ignored so editor
+/// backups and package-manager leftovers never take effect.
+pub fn fragment_paths(dir: &Path) -> Result<Vec<PathBuf>, ConfigFileError> {
+    let io_error = |source| ConfigFileError::Io {
+        path: dir.to_path_buf(),
+        source,
+    };
+    let mut paths = Vec::new();
+    for entry in std::fs::read_dir(dir).map_err(io_error)? {
+        let entry = entry.map_err(io_error)?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with('.') || Path::new(name.as_ref()).extension() != Some("toml".as_ref()) {
+            continue;
+        }
+        paths.push(entry.path());
+    }
+    paths.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+    Ok(paths)
+}
+
+/// Overlay `overlay` onto `base`: tables merge key by key; every other value,
+/// arrays included, replaces the existing one.
+fn merge_tables(base: &mut toml::Table, overlay: toml::Table) {
+    for (key, value) in overlay {
+        match (base.get_mut(&key), value) {
+            (Some(toml::Value::Table(existing)), toml::Value::Table(incoming)) => {
+                merge_tables(existing, incoming);
+            }
+            (_, value) => {
+                base.insert(key, value);
+            }
+        }
+    }
+}
+
+fn parse_table(path: &Path, contents: &str) -> Result<toml::Table, ConfigFileError> {
+    contents
+        .parse::<toml::Table>()
+        .map_err(|error| ConfigFileError::Parse {
+            path: path.to_path_buf(),
+            detail: parse_error_detail(contents, &error),
+        })
+}
+
+/// Load `base` (when present) and the fragments in `dir` (when present), merge
+/// them in order, and validate the merged result once.
+///
+/// A fragment may omit `[openshell] version`; the merged result must still
+/// declare [`SCHEMA_VERSION`]. A validation failure is attributed to the first
+/// layer whose addition makes the merged result invalid.
+#[cfg_attr(target_os = "windows", allow(clippy::result_large_err))]
+pub fn load_layered(
+    base: Option<&Path>,
+    dir: Option<&Path>,
+) -> Result<LayeredConfig, ConfigFileError> {
+    load_layered_staged(base, dir).map_err(|(error, _)| error)
+}
+
+/// Like [`load_layered`], but also reports whether the failure happened after
+/// every file was read and parsed, so the merged version was known.
+fn load_layered_staged(
+    base: Option<&Path>,
+    dir: Option<&Path>,
+) -> Result<LayeredConfig, (ConfigFileError, bool)> {
+    let early = |error| (error, false);
+    let mut layers: Vec<(PathBuf, toml::Table)> = Vec::new();
+    let mut paths: Vec<PathBuf> = base.map(Path::to_path_buf).into_iter().collect();
+    if let Some(dir) = dir {
+        paths.extend(fragment_paths(dir).map_err(early)?);
+    }
+    for path in paths {
+        let contents = read_config_contents(&path).map_err(early)?;
+        layers.push((path.clone(), parse_table(&path, &contents).map_err(early)?));
+    }
+
+    let mut merged = toml::Table::new();
+    for (_, table) in &layers {
+        merge_tables(&mut merged, table.clone());
+    }
+    let sources = layers.iter().map(|(path, _)| path.clone()).collect();
+    match finish_layered(merged) {
+        Ok(file) => Ok(LayeredConfig { file, sources }),
+        Err(error) => Err((attribute_to_layer(&layers, error), true)),
+    }
+}
+
+fn finish_layered(merged: toml::Table) -> Result<ConfigFile, ConfigFileError> {
+    // Check the version before deserializing so a legacy schema reports
+    // its version instead of tripping over fields it no longer has.
+    match merged
+        .get("openshell")
+        .and_then(toml::Value::as_table)
+        .and_then(|openshell| openshell.get("version"))
+    {
+        None => return Err(ConfigFileError::MissingVersion),
+        Some(toml::Value::Integer(version)) if *version != i64::from(SCHEMA_VERSION) => {
+            return Err(ConfigFileError::UnsupportedVersion {
+                version: u32::try_from(*version).unwrap_or(u32::MAX),
+            });
+        }
+        Some(_) => {}
+    }
+    let file: ConfigFile =
+        merged
+            .try_into()
+            .map_err(|error: toml::de::Error| ConfigFileError::Parse {
+                path: PathBuf::new(),
+                detail: without_quoted_strings(error.message().trim_end()),
+            })?;
+    validate_loaded(file)
+}
+
+/// Re-run the cumulative merge to find the first layer that introduces
+/// `error`, and report the error against that file.
+fn attribute_to_layer(
+    layers: &[(PathBuf, toml::Table)],
+    error: ConfigFileError,
+) -> ConfigFileError {
+    // Missing and unsupported versions are properties of the whole result.
+    if matches!(
+        error,
+        ConfigFileError::MissingVersion | ConfigFileError::UnsupportedVersion { .. }
+    ) {
+        return error;
+    }
+    let mut merged = toml::Table::new();
+    for (path, table) in layers {
+        merge_tables(&mut merged, table.clone());
+        let mut candidate = merged.clone();
+        // A prefix without a version would fail for that reason alone.
+        candidate
+            .entry("openshell")
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+            .as_table_mut()
+            .map(|t| {
+                t.entry("version")
+                    .or_insert(toml::Value::Integer(i64::from(SCHEMA_VERSION)))
+            });
+        if let Err(layer_error) = finish_layered(candidate) {
+            return match layer_error {
+                ConfigFileError::Parse { detail, .. } => ConfigFileError::Parse {
+                    path: path.clone(),
+                    detail,
+                },
+                other => other,
+            };
+        }
+    }
+    error
+}
+
+/// Layered counterpart of [`preflight`].
+///
+/// Validates the merged base and fragments without starting the gateway. The
+/// failure names the offending file, or the base or directory when the error
+/// has no more specific file.
+#[cfg_attr(target_os = "windows", allow(clippy::result_large_err))]
+pub fn preflight_layered(
+    base: Option<&Path>,
+    dir: Option<&Path>,
+) -> Result<LayeredConfig, ConfigPreflightError> {
+    load_layered_staged(base, dir).map_err(|(source, merged)| {
+        let version = match &source {
+            ConfigFileError::MissingVersion => "missing".to_string(),
+            ConfigFileError::UnsupportedVersion { version } => version.to_string(),
+            // Reaching validation means the merged result declared this version.
+            _ if merged => SCHEMA_VERSION.to_string(),
+            _ => "unavailable".to_string(),
+        };
+        let path = match &source {
+            ConfigFileError::Io { path, .. }
+            | ConfigFileError::NonRegular { path, .. }
+            | ConfigFileError::Parse { path, .. } => path.clone(),
+            _ => base.or(dir).map(Path::to_path_buf).unwrap_or_default(),
+        };
+        preflight_error(&path, version, source)
+    })
 }
 
 /// Return a driver's table without gateway-level inheritance.
@@ -3676,5 +3871,143 @@ ssh_gateway_port = 8080
             Some(10),
             "RPM defaults must retain Podman's readiness health check"
         );
+    }
+
+    fn layered_dir(
+        base: &str,
+        fragments: &[(&str, &str)],
+    ) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let base_path = dir.path().join("gateway.toml");
+        std::fs::write(&base_path, base).unwrap();
+        let frag_dir = dir.path().join("gateway.d");
+        std::fs::create_dir(&frag_dir).unwrap();
+        for (name, contents) in fragments {
+            std::fs::write(frag_dir.join(name), contents).unwrap();
+        }
+        (dir, base_path, frag_dir)
+    }
+
+    const BASE: &str = "[openshell]\nversion = 2\n[openshell.drivers.podman]\nuserns = \"auto\"\nsocket = \"/a\"\n";
+
+    #[test]
+    fn layered_fragment_overrides_and_adds_tables() {
+        let (_dir, base, frags) = layered_dir(
+            BASE,
+            &[(
+                "10-podman.toml",
+                "[openshell.drivers.podman]\nuserns = \"keep-id\"\n[openshell.drivers.docker]\nx = 1\n",
+            )],
+        );
+        let loaded = load_layered(Some(&base), Some(&frags)).unwrap();
+        let podman = loaded.file.openshell.drivers["podman"].as_table().unwrap();
+        assert_eq!(podman["userns"].as_str(), Some("keep-id"));
+        assert_eq!(
+            podman["socket"].as_str(),
+            Some("/a"),
+            "untouched keys survive"
+        );
+        assert!(loaded.file.openshell.drivers.contains_key("docker"));
+        assert_eq!(loaded.sources.len(), 2);
+    }
+
+    #[test]
+    fn layered_later_fragment_wins_in_lexical_order() {
+        let (_dir, base, frags) = layered_dir(
+            BASE,
+            &[
+                ("20-b.toml", "[openshell.drivers.podman]\nuserns = \"b\"\n"),
+                ("10-a.toml", "[openshell.drivers.podman]\nuserns = \"a\"\n"),
+                (
+                    "99.txt",
+                    "[openshell.drivers.podman]\nuserns = \"ignored\"\n",
+                ),
+                (
+                    ".hidden.toml",
+                    "[openshell.drivers.podman]\nuserns = \"ignored\"\n",
+                ),
+            ],
+        );
+        let loaded = load_layered(Some(&base), Some(&frags)).unwrap();
+        let podman = loaded.file.openshell.drivers["podman"].as_table().unwrap();
+        assert_eq!(podman["userns"].as_str(), Some("b"));
+        assert_eq!(loaded.sources.len(), 3);
+    }
+
+    #[test]
+    fn layered_arrays_replace() {
+        let mut base = toml::Table::new();
+        let mut overlay = toml::Table::new();
+        base.insert("a".into(), toml::Value::Array(vec![1.into(), 2.into()]));
+        overlay.insert("a".into(), toml::Value::Array(vec![3.into()]));
+        merge_tables(&mut base, overlay);
+        assert_eq!(base["a"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn layered_unknown_field_names_the_fragment() {
+        let (_dir, base, frags) = layered_dir(
+            BASE,
+            &[
+                ("10-ok.toml", "[openshell.drivers.podman]\nuserns = \"x\"\n"),
+                ("20-bad.toml", "[openshell.gateway]\nnot_a_field = 1\n"),
+            ],
+        );
+        let error = load_layered(Some(&base), Some(&frags)).unwrap_err();
+        assert!(error.to_string().contains("20-bad.toml"), "{error}");
+    }
+
+    #[test]
+    fn layered_parse_error_names_the_fragment_and_hides_values() {
+        let (_dir, base, frags) = layered_dir(
+            BASE,
+            &[("10-bad.toml", "[openshell\nsecret = \"hunter2\"\n")],
+        );
+        let error = load_layered(Some(&base), Some(&frags))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("10-bad.toml"), "{error}");
+        assert!(!error.contains("hunter2"), "{error}");
+    }
+
+    #[test]
+    fn layered_secret_in_fragment_is_rejected() {
+        let (_dir, base, frags) = layered_dir(
+            BASE,
+            &[(
+                "10-db.toml",
+                "[openshell.gateway]\ndatabase_url = \"postgres://u:p@h/db\"\n",
+            )],
+        );
+        let error = load_layered(Some(&base), Some(&frags)).unwrap_err();
+        assert!(
+            matches!(error, ConfigFileError::SecretInFile { .. }),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn layered_version_is_required_only_on_the_merged_result() {
+        let (_dir, base, frags) = layered_dir(
+            BASE,
+            &[("10-p.toml", "[openshell.drivers.podman]\nuserns = \"x\"\n")],
+        );
+        assert!(load_layered(Some(&base), Some(&frags)).is_ok());
+        let (_dir, base, frags) = layered_dir(
+            "[openshell.drivers.podman]\nsocket = \"/a\"\n",
+            &[("10-p.toml", "[openshell.drivers.podman]\nuserns = \"x\"\n")],
+        );
+        assert!(matches!(
+            load_layered(Some(&base), Some(&frags)).unwrap_err(),
+            ConfigFileError::MissingVersion
+        ));
+    }
+
+    #[test]
+    fn layered_without_fragments_matches_single_file() {
+        let (_dir, base, frags) = layered_dir(BASE, &[]);
+        let layered = load_layered(Some(&base), Some(&frags)).unwrap();
+        let single = load(&base).unwrap();
+        assert_eq!(layered.file.openshell.drivers, single.openshell.drivers);
     }
 }

@@ -66,6 +66,13 @@ startup use the same resolution. These values are trusted operator inputs, not
 sandbox request fields. Keep registry credentials in Podman's credential store
 rather than embedding them in image references.
 
+To customize settings without editing `gateway.toml`, add `*.toml` fragments to
+`~/.config/openshell/gateway.d/`. Fragments apply in lexical order after
+`gateway.toml`; a later file wins. Tables merge key by key, and scalars and
+arrays replace. For example, `gateway.d/10-podman.toml` containing
+`[openshell.drivers.podman]` with `userns = "keep-id"` changes only that key.
+Set `OPENSHELL_GATEWAY_CONFIG_DIR` to use a different directory.
+
 To override the path to the TOML config file entirely:
 
 ```shell
