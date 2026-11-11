@@ -5,9 +5,10 @@
 #
 # `podman_userns_mode` is default, auto, keep-id or private. Every mode except
 # default writes its `[openshell.drivers.podman]` settings to
-# `/etc/openshell-test/gateway-overrides.toml`, which every installer applies to the active
-# gateway-overrides.toml (the openshell_gateway role for `binaries`, the
-# openshell_packaged_gateway role for the packages); default removes the file. The
+# `/etc/openshell-test/gateway-overrides.toml`, which every installer installs as a
+# `gateway.d` drop-in next to the active gateway.toml (the openshell_gateway role
+# for `binaries`, the openshell_packaged_gateway role for the packages); default
+# removes the file. The
 # Podman support crate (tests/support/podman) reads the published mode and
 # runs Podman's own reference container in it.
 ---
